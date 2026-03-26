@@ -1,0 +1,26 @@
+[
+    {
+        "Name": "Documents",
+        "Description": "Example configuration for backing up unlocked log files from the Documents folder.",
+        "SourcePath": "c:\\Users\\User\\Documents\\logs",
+        "DestinationPath":  "d:\\Backups\\Documents",
+        "FileNamePattern": "^.*\\.log$",
+        "ArchiveNamePrefix": "Logs",
+        "ArchiveNameSuffix": "PROD",
+        "DateFormat": "dd-MM-yy",
+        "CleanSourceFiles": true,
+        "Mandatory": false
+    },
+    {
+        "Name": "File",
+        "Description": "Example configuration for backing up locked log file from the Documents folder.",
+        "SourcePath": "c:\\Users\\User\\Documents\\logs",
+        "DestinationPath":  "d:\\Backups\\Documents",
+        "FileNamePattern": "^current_active.log$",
+        "ArchiveNamePrefix": "",
+        "ArchiveNameSuffix": "",
+        "DateFormat": "",
+        "CleanSourceFiles": false,
+        "Mandatory": false
+    }
+]
