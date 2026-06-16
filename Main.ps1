@@ -210,7 +210,7 @@ try {
     Add-LogMessage "Configuration validation passed: $($Configurations.Count) rule(s) validated." INFO
 
     # Create folder for receipt
-    if (-not (Test-Path -Path $ReceiptPath -PathType Container)) { New-Item -Path $ReceiptPath -ItemType Directory -Force }
+    if (-not (Test-Path -Path $ReceiptPath -PathType Container)) { New-Item -Path $ReceiptPath -ItemType Directory -Force | Out-Null }
     ############## End Prerequisites Validation ##############
 
     ############## Start rules processing ##############
@@ -251,7 +251,7 @@ try {
                             Remove-Item -Path $LeftoverDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
                             continue
                         }
-                        $LeftoverArchiveFullPath = Join-Path -Path $Rule.DestinationPath -ChildPath "$($LeftoverDir.Name)$CleanupSuffix.zip"
+                        $LeftoverArchiveFullPath = Join-Path (Resolve-Path -LiteralPath $Rule.DestinationPath).Path "$($LeftoverDir.Name)$CleanupSuffix.zip"
                         Add-LogMessage "Recovering leftover temp dir '$($LeftoverDir.Name)' -> '$LeftoverArchiveFullPath'" WARN
 
                         # Capture file metadata before archiving for the recovery receipt.
@@ -263,9 +263,20 @@ try {
                             }
                         }
 
-                        # Compress without -sdel, then verify before deleting the source files.
+                        # Compress without -sdel, then verify before deleting the source files. Run with the
+                        # working directory set to the leftover dir and '*', so only bare file names are stored
+                        # (set both the PowerShell location and the process CWD; restore both afterwards).
                         $ZipAddArgs = @('a', '-tzip', '-mm=Deflate', "-mx=$RecoveryLevel")
-                        & $ZipPath $ZipAddArgs $LeftoverArchiveFullPath (Join-Path $LeftoverDir.FullName "*")
+                        $PrevCwd = [System.Environment]::CurrentDirectory
+                        Push-Location -LiteralPath $LeftoverDir.FullName
+                        try {
+                            [System.Environment]::CurrentDirectory = (Get-Location).Path
+                            & $ZipPath $ZipAddArgs $LeftoverArchiveFullPath '*'
+                        }
+                        finally {
+                            Pop-Location
+                            [System.Environment]::CurrentDirectory = $PrevCwd
+                        }
                         if ($LASTEXITCODE -ge 2) { throw "7-Zip failed with exit code $LASTEXITCODE." }
                         if (-not (Test-Path -Path $LeftoverArchiveFullPath -PathType Leaf)) { throw "7-Zip completed but archive was not created." }
 
@@ -417,7 +428,8 @@ try {
                     $Prefix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { "$($Rule.ArchiveNamePrefix)_" } else { "" }
                     $Suffix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNameSuffix)) { "_$($Rule.ArchiveNameSuffix)" } else { "" }
                     $ArchiveName = "$Prefix$($env:COMPUTERNAME)_$Timestamp$Suffix.zip"
-                    $ArchiveFullPath = Join-Path -Path $Rule.DestinationPath -ChildPath $ArchiveName
+                    # Absolute, so it stays correct when 7-Zip's working directory is switched below.
+                    $ArchiveFullPath = Join-Path (Resolve-Path -LiteralPath $Rule.DestinationPath).Path $ArchiveName
 
                     ############## Start free-space pre-flight ##############
                     # Estimate required space and verify the volume(s) can hold it before staging anything.
@@ -462,7 +474,7 @@ try {
 
                     # Create TMP container directory for copy/move files.
                     $TmpContainerDirPath = Join-Path -Path $Rule.SourcePath -ChildPath "$Prefix$($env:COMPUTERNAME)_$Timestamp"
-                    New-Item -Path $TmpContainerDirPath -ItemType Directory -Force
+                    New-Item -Path $TmpContainerDirPath -ItemType Directory -Force | Out-Null
 
                     # Stage files into the temp container directory (move vs copy depends on the rule).
                     switch ($Rule.CleanSourceFiles) {
@@ -503,9 +515,22 @@ try {
                     # Compress the staged files. -sdel is intentionally NOT used: the staged copies must
                     # survive until the archive passes its integrity test, so a failed/corrupt archive
                     # leaves the temp dir intact for the leftover-recovery pass on the next run.
+                    # 7-Zip is run with its working directory set to the temp dir and given '*', so the
+                    # archive stores bare file names rather than the temp dir's path. Both the PowerShell
+                    # location and the process CWD are set (Windows PowerShell uses the latter for native
+                    # commands, PowerShell 7 the former); both are restored afterwards.
                     $Level = if ($null -ne $Rule.CompressionLevel) { [int]$Rule.CompressionLevel } else { $DefaultCompressionLevel }
                     $ZipAddArgs = @('a', '-tzip', '-mm=Deflate', "-mx=$Level")
-                    & $ZipPath $ZipAddArgs $ArchiveFullPath (Join-Path $TmpContainerDirPath "*")
+                    $PrevCwd = [System.Environment]::CurrentDirectory
+                    Push-Location -LiteralPath $TmpContainerDirPath
+                    try {
+                        [System.Environment]::CurrentDirectory = (Get-Location).Path
+                        & $ZipPath $ZipAddArgs $ArchiveFullPath '*'
+                    }
+                    finally {
+                        Pop-Location
+                        [System.Environment]::CurrentDirectory = $PrevCwd
+                    }
                     if ($LASTEXITCODE -ge 2) { throw "7-Zip process failed with exit code $LASTEXITCODE for archive '$ArchiveFullPath'." }
                     if (-not (Test-Path -Path $ArchiveFullPath -PathType Leaf)) { throw "7-Zip completed but archive was not created at '$ArchiveFullPath'." }
 
