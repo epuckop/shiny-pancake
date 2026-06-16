@@ -237,7 +237,6 @@ try {
 
             ############## Start leftover temp directory cleanup ##############
             $CleanupPrefix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { "$($Rule.ArchiveNamePrefix)_" } else { "" }
-            $CleanupSuffix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNameSuffix)) { "_$($Rule.ArchiveNameSuffix)" } else { "" }
             $LeftoverDirs = Get-ChildItem -Path $Rule.SourcePath -Directory -Filter "$CleanupPrefix$($env:COMPUTERNAME)_*" -ErrorAction SilentlyContinue
 
             if ($LeftoverDirs) {
@@ -251,7 +250,8 @@ try {
                             Remove-Item -Path $LeftoverDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
                             continue
                         }
-                        $LeftoverArchiveFullPath = Join-Path (Resolve-Path -LiteralPath $Rule.DestinationPath).Path "$($LeftoverDir.Name)$CleanupSuffix.zip"
+                        # The leftover dir name is already the archive base name, so just add '.zip'.
+                        $LeftoverArchiveFullPath = Join-Path (Resolve-Path -LiteralPath $Rule.DestinationPath).Path "$($LeftoverDir.Name).zip"
                         Add-LogMessage "Recovering leftover temp dir '$($LeftoverDir.Name)' -> '$LeftoverArchiveFullPath'" WARN
 
                         # Capture file metadata before archiving for the recovery receipt.
@@ -427,7 +427,10 @@ try {
 
                     $Prefix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { "$($Rule.ArchiveNamePrefix)_" } else { "" }
                     $Suffix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNameSuffix)) { "_$($Rule.ArchiveNameSuffix)" } else { "" }
-                    $ArchiveName = "$Prefix$($env:COMPUTERNAME)_$Timestamp$Suffix.zip"
+                    # The temp dir is named after the archive base (suffix included), so if someone zips the
+                    # temp dir by hand the resulting name already matches the standard archive name.
+                    $ArchiveBaseName = "$Prefix$($env:COMPUTERNAME)_$Timestamp$Suffix"
+                    $ArchiveName = "$ArchiveBaseName.zip"
                     # Absolute, so it stays correct when 7-Zip's working directory is switched below.
                     $ArchiveFullPath = Join-Path (Resolve-Path -LiteralPath $Rule.DestinationPath).Path $ArchiveName
 
@@ -473,7 +476,7 @@ try {
                     $FilePaths = $Job.Files | ForEach-Object { $_.FullName }
 
                     # Create TMP container directory for copy/move files.
-                    $TmpContainerDirPath = Join-Path -Path $Rule.SourcePath -ChildPath "$Prefix$($env:COMPUTERNAME)_$Timestamp"
+                    $TmpContainerDirPath = Join-Path -Path $Rule.SourcePath -ChildPath $ArchiveBaseName
                     New-Item -Path $TmpContainerDirPath -ItemType Directory -Force | Out-Null
 
                     # Stage files into the temp container directory (move vs copy depends on the rule).
