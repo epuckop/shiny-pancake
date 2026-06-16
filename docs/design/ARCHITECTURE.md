@@ -78,6 +78,7 @@ START
   │     ├─► Rule Prerequisites
   │     │     ├─ SourcePath exists?
   │     │     ├─ DestinationPath exists?
+  │     │     ├─ Leftover recovery (archive+verify orphaned temp dirs)
   │     │     ├─ Files found?
   │     │     └─ Apply FileNamePattern filter
   │     │
@@ -88,16 +89,20 @@ START
   │     │     │     │       Group by LastWriteTime date
   │     │     │     │       One job per date group
   │     │     │     │
-  │     │     └─ NO → One job for all files
+  │     │     ├─ NO → One job for all files
+  │     │     └─ Sort jobs ascending by size
   │     │
-  │     └─► Job Execution (foreach job)
+  │     └─► Job Execution (foreach job, smallest first)
+  │           ├─ Free-space pre-flight (skip if it won't fit)
   │           ├─ Build archive name
   │           ├─ Create temp dir
-  │           ├─ Move/Copy files → temp dir
-  │           ├─ 7za.exe compress + delete temp
+  │           ├─ Move/Copy files → temp dir (.NET File API)
+  │           ├─ 7za a compress  →  7za t verify
+  │           ├─ Remove temp dir (only after verify)
   │           └─ Write JSON receipt
   │
   └─► PHASE 3: Cleanup
+        ├─► Write summary + compute exit code (0/1/2)
         └─► Stop-LogProcessor
 ```
 
@@ -172,11 +177,13 @@ START
 │  │                                      │           │
 │  │  2. Create temp dir in SourcePath    │           │
 │  │                                      │           │
-│  │  3. Move/Copy files → temp dir       │           │
+│  │  3. Free-space pre-flight check      │           │
 │  │                                      │           │
-│  │  4. 7za.exe a -sdel <archive> *      │           │
+│  │  4. Move/Copy files → temp dir       │           │
+│  │     (.NET File API)                  │           │
 │  │                                      │           │
-│  │  5. Remove temp dir                  │           │
+│  │  5. 7za a <archive> * → 7za t verify │           │
+│  │     remove temp dir after verify     │           │
 │  │                                      │           │
 │  │  6. Write JSON receipt               │           │
 │  └──────────────────────────────────────┘           │
@@ -354,31 +361,33 @@ START
 │                            │                                      │
 │                            ▼                                      │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 3. Transfer Files to Temp Dir                               │  │
+│  │ 3. Free-space pre-flight (skip job if it won't fit)         │  │
+│  │                                                             │  │
+│  │ 4. Transfer Files to Temp Dir (.NET File API)               │  │
 │  │                                                             │  │
 │  │  CleanSourceFiles = true:                                   │  │
-│  │    Move-Item app.log, error.log → temp dir                 │  │
-│  │    (originals deleted)                                      │  │
+│  │    [IO.File]::Move app.log... → temp (copy fallback if      │  │
+│  │    locked; originals removed)                               │  │
 │  │                                                             │  │
 │  │  CleanSourceFiles = false:                                  │  │
-│  │    Copy-Item app.log, error.log → temp dir                 │  │
-│  │    (originals preserved)                                    │  │
+│  │    [IO.File]::Copy app.log... → temp (originals preserved)  │  │
 │  └────────────────────────┬───────────────────────────────────┘  │
 │                            │                                      │
 │                            ▼                                      │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 4. Compress with 7-Zip                                      │  │
+│  │ 5. Compress, verify, then delete staged files               │  │
 │  │                                                             │  │
-│  │    7za.exe a -tzip -mm=Deflate -mx=9 -sdel                 │  │
+│  │    7za a -tzip -mm=Deflate -mx=<CompressionLevel>          │  │
 │  │       D:\archives\AppLog_COMPUTERNAME_14-01-25.zip         │  │
 │  │       D:\app\logs\AppLog_COMPUTERNAME_14-01-25\*           │  │
 │  │                                                             │  │
-│  │    -sdel: delete temp dir contents after zipping            │  │
+│  │    7za t <archive>   ← integrity test                       │  │
+│  │    only on success → remove temp dir (no -sdel)             │  │
 │  └────────────────────────┬───────────────────────────────────┘  │
 │                            │                                      │
 │                            ▼                                      │
 │  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 5. Generate Receipt JSON                                    │  │
+│  │ 6. Generate Receipt JSON                                    │  │
 │  │                                                             │  │
 │  │    receipt/2025-01-15/AppLog_14-01-25_1736934000.json     │  │
 │  │    ┌─────────────────────────────────────────────────┐     │  │
@@ -451,7 +460,7 @@ START
 │    │                                          └───────────────┘  │
 │    │                                                             │
 │    └─── External: 7za.exe ──────────────────────────────────────┘
-│         (process spawn, -sdel flag)                              │
+│         (process spawn: 'a' compress, then 't' integrity test)   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -495,16 +504,16 @@ START
 │  ┌──────────────────────────────────────────────────────────┐    │
 │  │  Global try/finally (main.ps1)                           │    │
 │  │  ┌────────────────────────────────────────────────────┐  │    │
-│  │  │  finally: Stop-LogProcessor                        │  │    │
+│  │  │  catch: log ERROR (does not re-throw)              │  │    │
+│  │  finally: write summary, compute exit code,        │  │    │
+│  │           Stop-LogProcessor                         │  │    │
 │  │  └────────────────────────────────────────────────────┘  │    │
-│  │                                                          │    │
-│  │  throw → script abort, critical error                    │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                    │
 │  ┌──────────────────────────────────────────────────────────┐    │
 │  │  Rule try/catch/finally                                  │    │
 │  │  ┌────────────────────────────────────────────────────┐  │    │
-│  │  │  catch: log WARN, continue to next rule            │  │    │
+│  │  │  catch: log ERROR, continue to next rule           │  │    │
 │  │  │  finally: log "Finished rule"                      │  │    │
 │  │  └────────────────────────────────────────────────────┘  │    │
 │  └──────────────────────────────────────────────────────────┘    │
@@ -512,15 +521,22 @@ START
 │  ┌──────────────────────────────────────────────────────────┐    │
 │  │  Job try/catch/finally                                   │    │
 │  │  ┌────────────────────────────────────────────────────┐  │    │
-│  │  │  catch: log ERROR, skip this job                   │  │    │
+│  │  │  catch: log ERROR, remove fresh partial archive,   │  │    │
+│  │  │         skip this job                              │  │    │
 │  │  │  finally: log "Ending Job"                         │  │    │
 │  │  └────────────────────────────────────────────────────┘  │    │
 │  └──────────────────────────────────────────────────────────┘    │
 │                                                                    │
 │  Severity Levels:                                                │
-│    ERROR  →  script abort (global) or rule skip (rule-level)     │
-│    WARN   →  log warning, continue processing                    │
-│    INFO   →  log informational message                           │
+│    ERROR  →  log error; counts toward exit code 2               │
+│    WARN   →  log warning; counts toward exit code 1             │
+│    INFO   →  log informational message                          │
+│                                                                  │
+│  Exit codes (the only signal the external scheduler reads):     │
+│    0 = clean   1 = warnings only   2 = any errors               │
+│  Counts come from Get-LogStats; the global finally sets the     │
+│  code. Errors are logged, never re-thrown, so the process       │
+│  always exits deterministically (a missing module exits 2).     │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -532,11 +548,17 @@ START
 |---|---|
 | **Exclude today's files** when `CleanSourceFiles=true` | Prevents archiving files that are still being written to, avoiding corruption |
 | **Group by date** when `CleanSourceFiles=true` | Keeps archives organized by day, making restoration and auditing easier |
-| **Temp directory approach** | Single 7-Zip invocation is more efficient than per-file compression; `-sdel` ensures atomic cleanup |
+| **Temp directory approach** | Single 7-Zip invocation is more efficient than per-file compression |
+| **Integrity test before delete** | Compress (no `-sdel`), run `7za t`, and only then delete the staged files. A failed/corrupt archive leaves the temp dir intact, so the next run's leftover-recovery pass salvages it — no data loss |
+| **Leftover recovery** | Temp dirs left by an interrupted run are detected, archived, verified, and removed (with their own receipt) at the start of each rule |
+| **Free-space pre-flight** | Before each job, estimate required space (per `ExpectedCompressionPercent` + buffer) and skip gracefully if it won't fit. Jobs run smallest-first so each completion can free space for the next |
+| **Smallest-first ordering** | On a tight disk, completing small jobs first frees source space; once one job doesn't fit, no larger one will, so the rest are skipped with exit code 2 |
+| **Resource throttling** | Best-effort lower priority + CPU affinity so the tool doesn't starve the host; failure is logged and ignored |
+| **Exit codes 0/1/2** | The external scheduler reads only the exit code, so errors are logged (never re-thrown) and the global finally exits deterministically |
 | **Async logger** | Prevents log I/O from blocking the main archival loop |
 | **JSON receipts** | Provides an audit trail with file paths, archive paths, and original UTC write times |
 | **InvariantCulture** | Ensures consistent date/number formatting across different machine locales |
-| **`-sdel` flag** | Automatically deletes the temp directory after compression, avoiding orphaned temp files |
+| **PowerShell 4 compatibility** | Targets Windows PowerShell 4; avoids PS5-only syntax such as `[type]::new()` |
 
 ---
 
@@ -562,5 +584,6 @@ shiny-pancake/
 │       └── <JobName>_<unix_ts>.json  # Per-job receipts
 └── docs/
     └── design/
-        └── ARCHITECTURE.md           # This document
+        ├── ARCHITECTURE.md           # This document
+        └── FLOWCHARTS.md             # Companion Mermaid flowcharts
 ```

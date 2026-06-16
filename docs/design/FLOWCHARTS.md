@@ -154,23 +154,25 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Start Job] --> B[Build ArchiveName]
-    B --> C[Create temp dir]
+    B --> SP{Enough free space?}
+    SP -->|No| SX[Log ERROR, break: skip this + larger jobs]
+    SP -->|Yes| C[Create temp dir]
     C --> D{CleanSourceFiles?}
-    D -->|true| E[Move-Item to temp]
-    D -->|false| F[Copy-Item to temp]
-    E --> G[7za.exe compress -sdel]
+    D -->|true| E["[IO.File]::Move to temp (copy fallback if locked)"]
+    D -->|false| F["[IO.File]::Copy to temp"]
+    E --> G[7za a compress, no -sdel]
     F --> G
-    G --> H{7-Zip success?}
+    G --> H{7-Zip success and archive exists?}
     H -->|No| I[Log ERROR, throw]
-    H -->|Yes| J{Archive exists?}
-    J -->|No| K[Log ERROR, throw]
-    J -->|Yes| L[Remove temp dir]
+    H -->|Yes| T{7za t integrity OK?}
+    T -->|No| I
+    T -->|Yes| L[Remove temp dir]
     L --> M[Write JSON receipt]
     M --> N[Log INFO: Job done]
-    I --> O[Log ERROR: Job failed]
-    K --> O
+    I --> O[Log ERROR, remove fresh partial archive]
     N --> P[End Job]
     O --> P
+    SX --> P
 ```
 
 ---
@@ -216,17 +218,18 @@ flowchart TD
     A[Global try] --> B[Rule try]
     B --> C[Job try]
     C --> D[Job catch]
-    D --> E[Log ERROR, continue]
+    D --> E[Log ERROR, remove fresh partial archive, continue]
     C --> F[Job finally]
     F --> G[Log INFO]
     B --> H[Rule catch]
-    H --> I[Log WARN, continue]
+    H --> I[Log ERROR, continue]
     B --> J[Rule finally]
     J --> K[Log INFO]
     A --> L[Global catch]
-    L --> M[throw critical error]
+    L --> M[Log ERROR: unhandled error]
     A --> N[Global finally]
-    N --> O[Stop-LogProcessor]
+    N --> O[Write summary, compute exit code 0/1/2]
+    O --> P[Stop-LogProcessor]
 ```
 
 ---
@@ -258,10 +261,10 @@ flowchart TD
     A[Original file: app.log<br/>LastWrite: 2025-01-14] --> B{Today's date?}
     B -->|Yes| C[EXCLUDED from archive]
     B -->|No| D[Move to temp dir]
-    D --> E[Temp dir: app.log<br/>Move-Item removes original]
-    E --> F[7za.exe compress]
+    D --> E["Temp dir: app.log<br/>[IO.File]::Move removes original"]
+    E --> F[7za a compress, then 7za t verify]
     F --> G[Archive: AppLog_14-01-25.zip]
-    G --> H[Temp dir deleted<br/>-sdel flag]
+    G --> H[Temp dir deleted<br/>only after integrity test passes]
     H --> I[Receipt entry:<br/>LastWriteTimeUtc: 2025-01-14T...]
     C --> J[File remains in source]
 ```
@@ -273,11 +276,11 @@ flowchart TD
 ```mermaid
 flowchart TD
     A[Original file: app.log<br/>LastWrite: 2025-01-14] --> B[Copy to temp dir]
-    B --> C[Temp dir: app.log<br/>Copy preserves original]
+    B --> C["Temp dir: app.log<br/>[IO.File]::Copy preserves original"]
     C --> D[Original still in source]
-    D --> E[7za.exe compress]
+    D --> E[7za a compress, then 7za t verify]
     E --> F[Archive: AppLog_14-01-25.zip]
-    F --> G[Temp dir deleted]
+    F --> G[Temp dir deleted after verify]
     G --> H[Receipt entry:<br/>LastWriteTimeUtc: 2025-01-14T...]
     H --> I[File still exists in source]
 ```

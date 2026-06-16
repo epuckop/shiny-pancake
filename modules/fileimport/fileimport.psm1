@@ -25,13 +25,10 @@ function Get-JsonContent {
 
     
     process {
-        try {    
-            $ResolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
-            if (-not (Test-Path -Path $ResolvedPath -PathType Leaf)) { throw "Path '$ResolvedPath' does not point to a file." }
-            $JsonContent = Get-Content -Path $ResolvedPath -Raw -Encoding UTF8
-            return ConvertFrom-Json -InputObject $JsonContent
-        }
-        catch { throw $_ }
+        $ResolvedPath = Resolve-Path -Path $Path -ErrorAction Stop
+        if (-not (Test-Path -Path $ResolvedPath -PathType Leaf)) { throw "Path '$ResolvedPath' does not point to a file." }
+        $JsonContent = Get-Content -Path $ResolvedPath -Raw -Encoding UTF8
+        return ConvertFrom-Json -InputObject $JsonContent
     }
 }
 

@@ -7,6 +7,14 @@
     Path to the JSON file containing archiving rules. Defaults to 'configurations\directories_list.json'.
 .PARAMETER LogFile
     Path to the log file for this execution. Defaults to a dated file in the 'logs\' directory.
+.PARAMETER LimitResources
+    When $true (default), the script lowers its process priority and restricts CPU affinity to reduce
+    its impact on the system. Set to $false to run without any resource throttling.
+.PARAMETER CpuPercent
+    Approximate percentage of CPU cores the process is allowed to use (1-100, default 50). The core count
+    is floored so the budget is never exceeded, with a minimum of 1 core. Ignored if -LimitResources is $false.
+.PARAMETER ProcessPriority
+    Process priority class to apply (default 'BelowNormal'). Ignored if -LimitResources is $false.
 .NOTES
     Author: Dmitry Goldenberg
     Compatibility: Windows PowerShell 4 and later.
@@ -14,7 +22,10 @@
 
 param(
     [string]$JsonConfigPath = (Join-Path $PSScriptRoot "configurations\directories_list.json"),
-    [string]$LogFile = (Join-Path $PSScriptRoot "logs\log_$(Get-Date -Format "yyyy-MM-dd").log")
+    [string]$LogFile = (Join-Path $PSScriptRoot "logs\log_$(Get-Date -Format "yyyy-MM-dd").log"),
+    [bool]$LimitResources = $true,
+    [ValidateRange(1, 100)][int]$CpuPercent = 50,
+    [ValidateSet('Idle', 'BelowNormal', 'Normal', 'AboveNormal', 'High')][string]$ProcessPriority = 'BelowNormal'
 )
 
 ###################################################
@@ -30,13 +41,12 @@ $StandardDateFormat = 'dd-MM-yy'
 
 # --- 7-Zip Configuration ---
 $ZipPath = (Join-Path $PSScriptRoot "bin\7zip\7za.exe")
-$ZipArgumentsSDel = @(
-    'a',
-    '-tzip',
-    '-mm=Deflate',
-    '-mx=9',
-    '-sdel'
-)
+# Default 7-Zip compression level (0-9). Overridable per-rule via 'CompressionLevel' in the config.
+$DefaultCompressionLevel = 5
+
+# --- Free-space pre-flight ---
+# Static safety margin added on top of the estimated archive size for the disk-space check.
+$SpaceSafetyBufferBytes = 256MB
 
 # Receipt path
 $ReceiptPath = (Join-Path $PSScriptRoot "receipt\$(Get-Date -Format "yyyy-MM-dd")")
@@ -49,13 +59,15 @@ $ReceiptPath = (Join-Path $PSScriptRoot "receipt\$(Get-Date -Format "yyyy-MM-dd"
 ############## Import requested modules ##############
 ######################################################
 
-# Import logger
-try { Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules\logger') -ErrorAction Stop }
-catch { throw "Critical Error: 'modules\logger' not found or failed to load. Script cannot continue. `nError: $_" }
-
-# Import file reader
-try { Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'modules\fileimport') -ErrorAction Stop }
-catch { throw "Critical Error: 'modules\fileimport' not found or failed to load. Script cannot continue. `nError: $_" }
+foreach ($Module in 'logger', 'fileimport') {
+    try { Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath "modules\$Module") -ErrorAction Stop }
+    catch {
+        # Logger is not available yet — write to stderr and exit with the error code (2) so the
+        # external scheduler, which only inspects the exit code, sees a failure rather than exit 1.
+        [Console]::Error.WriteLine("Critical Error: 'modules\$Module' not found or failed to load. Script cannot continue.`nError: $_")
+        exit 2
+    }
+}
 
 #################################################
 ############## Starting main logic ##############
@@ -67,8 +79,34 @@ try {
     Start-LogProcessor -LogFilePath $LogFile
     Add-LogMessage "Starting Script" INFO
 
+    ############## Start resource throttling ##############
+    # Best-effort: lower priority and restrict CPU affinity. Failure here must not stop the run.
+    if ($LimitResources) {
+        try {
+            $Proc = [System.Diagnostics.Process]::GetCurrentProcess()
+            $Proc.PriorityClass = $ProcessPriority
+
+            # Floor the core budget so we never exceed the requested percentage; at least 1 core.
+            $TotalCores = [System.Environment]::ProcessorCount
+            $AllowedCores = [int][Math]::Max(1, [Math]::Floor($TotalCores * $CpuPercent / 100.0))
+            $ShiftCores = $TotalCores - $AllowedCores
+            # Bitmask of the highest $AllowedCores cores, leaving the low cores for the OS/foreground.
+            $Mask = ([int64][Math]::Pow(2, $AllowedCores) - 1) * [int64][Math]::Pow(2, $ShiftCores)
+            $Proc.ProcessorAffinity = [IntPtr]$Mask
+
+            Add-LogMessage "Resource throttling applied: priority '$ProcessPriority', $AllowedCores of $TotalCores core(s) (~$CpuPercent%)." INFO
+        }
+        catch {
+            Add-LogMessage "Could not apply resource throttling. Continuing without it. Error: $($_.Exception.Message)" WARN
+        }
+    }
+    else {
+        Add-LogMessage "Resource throttling disabled by parameter. Running at default priority/affinity." INFO
+    }
+    ############## End resource throttling ##############
+
     ############## Start Prerequisites Validation ##############
-    # Description: Running pre-flight checks to ensure the environment is ready for execution.
+    # Run pre-flight checks to ensure the environment is ready for execution.
 
     # Check for 7-Zip and verify it is functional
     if (-not (Test-Path -Path $ZipPath -PathType Leaf)) {
@@ -79,7 +117,7 @@ try {
     $ZipOutput = & $ZipPath 2>&1
     if ($LASTEXITCODE -eq 0) {
         $ZipVersion = ($ZipOutput | Select-String '7-Zip').Line.Trim()
-        Add-LogMessage "Prerequisite succeed: 7-Zip is functional. $ZipVersion" INFO
+        Add-LogMessage "Prerequisite passed: 7-Zip is functional. $ZipVersion" INFO
     }
     else {
         Add-LogMessage "Prerequisite failed: 7-Zip executable at '$ZipPath' is not functional. Exit code: $LASTEXITCODE" ERROR
@@ -148,6 +186,22 @@ try {
                 $ConfigValid = $false
             }
         }
+
+        if ($null -ne $Rule.CompressionLevel) {
+            $ParsedLevel = $Rule.CompressionLevel -as [int]
+            if ($null -eq $ParsedLevel -or $ParsedLevel -lt 0 -or $ParsedLevel -gt 9) {
+                Add-LogMessage "Config validation: Rule $RuleLabel has invalid 'CompressionLevel' value '$($Rule.CompressionLevel)'. Must be an integer 0-9." ERROR
+                $ConfigValid = $false
+            }
+        }
+
+        if ($null -ne $Rule.ExpectedCompressionPercent) {
+            $ParsedPercent = $Rule.ExpectedCompressionPercent -as [int]
+            if ($null -eq $ParsedPercent -or $ParsedPercent -lt 0 -or $ParsedPercent -gt 99) {
+                Add-LogMessage "Config validation: Rule $RuleLabel has invalid 'ExpectedCompressionPercent' value '$($Rule.ExpectedCompressionPercent)'. Must be an integer 0-99." ERROR
+                $ConfigValid = $false
+            }
+        }
     }
 
     if (-not $ConfigValid) {
@@ -168,21 +222,81 @@ try {
             Add-LogMessage "Starting rule: '$($Rule.Name)'" INFO
 
             ############## Start rule Prerequisites validation ##############
-            # Validate source paths from config.            
+            # Validate the source path from config.
             if (-not (Test-Path -Path $Rule.SourcePath -PathType Container)) {
                 Add-LogMessage "Source directory '$($Rule.SourcePath)' not found. Skipping rule." WARN
                 continue
             }
 
-            # Validate destination paths from config.
+            # Validate the destination path from config.
             if (-not (Test-Path -Path $Rule.DestinationPath -PathType Container)) {
-                Add-LogMessage "Destination directory '$($Rule.DestinationPath)' is not found. Skipping rule." ERROR
+                Add-LogMessage "Destination directory '$($Rule.DestinationPath)' not found. Skipping rule." ERROR
                 continue
             }
             Add-LogMessage "Paths for rule '$($Rule.Name)' are validated." INFO
 
-            # Validate target files existence & target files list preparation
-            # Get all files from the source directory.
+            ############## Start leftover temp directory cleanup ##############
+            $CleanupPrefix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { "$($Rule.ArchiveNamePrefix)_" } else { "" }
+            $CleanupSuffix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNameSuffix)) { "_$($Rule.ArchiveNameSuffix)" } else { "" }
+            $LeftoverDirs = Get-ChildItem -Path $Rule.SourcePath -Directory -Filter "$CleanupPrefix$($env:COMPUTERNAME)_*" -ErrorAction SilentlyContinue
+
+            if ($LeftoverDirs) {
+                Add-LogMessage "Found $($LeftoverDirs.Count) leftover temp directory(ies) from a previous interrupted run." WARN
+                $RecoveryLevel = if ($null -ne $Rule.CompressionLevel) { [int]$Rule.CompressionLevel } else { $DefaultCompressionLevel }
+                foreach ($LeftoverDir in $LeftoverDirs) {
+                    try {
+                        $LeftoverContents = Get-ChildItem -Path $LeftoverDir.FullName -File -ErrorAction SilentlyContinue
+                        if (-not $LeftoverContents) {
+                            Add-LogMessage "Leftover temp dir '$($LeftoverDir.Name)' is empty. Removing." WARN
+                            Remove-Item -Path $LeftoverDir.FullName -Force -Recurse -ErrorAction SilentlyContinue
+                            continue
+                        }
+                        $LeftoverArchiveFullPath = Join-Path -Path $Rule.DestinationPath -ChildPath "$($LeftoverDir.Name)$CleanupSuffix.zip"
+                        Add-LogMessage "Recovering leftover temp dir '$($LeftoverDir.Name)' -> '$LeftoverArchiveFullPath'" WARN
+
+                        # Capture file metadata before archiving for the recovery receipt.
+                        $RecoveredFilesInfo = @()
+                        foreach ($File in $LeftoverContents) {
+                            $RecoveredFilesInfo += [pscustomobject]@{
+                                Name             = $File.Name
+                                LastWriteTimeUtc = $File.LastWriteTimeUtc.ToString('o')
+                            }
+                        }
+
+                        # Compress without -sdel, then verify before deleting the source files.
+                        $ZipAddArgs = @('a', '-tzip', '-mm=Deflate', "-mx=$RecoveryLevel")
+                        & $ZipPath $ZipAddArgs $LeftoverArchiveFullPath (Join-Path $LeftoverDir.FullName "*")
+                        if ($LASTEXITCODE -ge 2) { throw "7-Zip failed with exit code $LASTEXITCODE." }
+                        if (-not (Test-Path -Path $LeftoverArchiveFullPath -PathType Leaf)) { throw "7-Zip completed but archive was not created." }
+
+                        & $ZipPath t $LeftoverArchiveFullPath
+                        if ($LASTEXITCODE -ne 0) { throw "Archive integrity test failed with exit code $LASTEXITCODE." }
+
+                        if (Test-Path -Path $LeftoverDir.FullName) { Remove-Item -Path $LeftoverDir.FullName -Force -Recurse -ErrorAction SilentlyContinue }
+
+                        # Write a recovery receipt.
+                        $RecoveryUTC = (Get-Date).ToUniversalTime()
+                        $UFormat = Get-Date -Date $RecoveryUTC -UFormat %s
+                        $ReceiptFilePath = "$ReceiptPath\$($LeftoverDir.Name)_recovered_$UFormat.json"
+                        $RecoveryReceipt = @{
+                            Name      = $LeftoverDir.Name
+                            Recovered = $true
+                            UTC       = $RecoveryUTC.ToString('o')
+                            Archive   = $LeftoverArchiveFullPath
+                            Files     = $RecoveredFilesInfo
+                        }
+                        $RecoveryReceipt | ConvertTo-Json -Depth 3 | Set-Content -Path $ReceiptFilePath -Encoding utf8
+
+                        Add-LogMessage "Leftover temp dir '$($LeftoverDir.Name)' successfully recovered." INFO
+                    }
+                    catch {
+                        Add-LogMessage "Failed to recover leftover temp dir '$($LeftoverDir.Name)'. Error: $_" ERROR
+                    }
+                }
+            }
+            ############## End leftover temp directory cleanup ##############
+
+            # Discover all files in the source directory (pattern filtering happens further below).
             $AllFilesInSourceDir = Get-ChildItem -Path $Rule.SourcePath -File -ErrorAction SilentlyContinue
 
             if (-not $AllFilesInSourceDir) {
@@ -216,7 +330,7 @@ try {
             ############## Start jobs generation ##############
             $Jobs = @()
             if ($Rule.CleanSourceFiles) {
-                Add-LogMessage "This rule '$($Rule.Name)' can have few jobs" INFO
+                Add-LogMessage "Rule '$($Rule.Name)' may generate multiple jobs (one per date)." INFO
 
                 # Filter files by date: ignore anything modified today.
                 $Today = (Get-Date).Date # Get date with time at 00:00:00
@@ -231,8 +345,8 @@ try {
 
                 # Process each date group.
                 foreach ($DateGroup in $GroupedByDate) {
-                    Add-LogMessage "Starting processing date group: '$($DateGroup.Name)'" INFO
-                    
+                    Add-LogMessage "Processing date group: '$($DateGroup.Name)'" INFO
+
                     $BackupDateName = [DateTime]::ParseExact($DateGroup.Name, $StandardDateFormat, $InvariantCulture)
                     $JobName = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { "$($Rule.ArchiveNamePrefix)_$($BackupDateName.ToString($StandardDateFormat))" } else { "$($Rule.Name)_$($BackupDateName.ToString($StandardDateFormat))" }
 
@@ -250,13 +364,14 @@ try {
                         UTC        = (Get-Date).ToUniversalTime()
                         FilesInfo  = $FilesToStageWithInfo
                         Files      = $DateGroup.Group
-                    }                        
+                        SizeBytes  = [int64](($DateGroup.Group | Measure-Object -Property Length -Sum).Sum)
+                    }
 
-                    Add-LogMessage "Ending processing date group: '$($DateGroup.Name)'" INFO
+                    Add-LogMessage "Finished date group: '$($DateGroup.Name)'" INFO
                 }
             }
             else { 
-                Add-LogMessage "This rule '$($Rule.Name)' have only one job." INFO
+                Add-LogMessage "Rule '$($Rule.Name)' generates a single job." INFO
 
                 $JobName = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { $Rule.ArchiveNamePrefix } else { $Rule.Name }
                 $BackupDateString = (Get-Date).ToString($StandardDateFormat, $InvariantCulture)
@@ -275,8 +390,13 @@ try {
                     UTC        = (Get-Date).ToUniversalTime()
                     FilesInfo  = $FilesToStageWithInfo
                     Files      = $FilteredFiles
-                }                        
+                    SizeBytes  = [int64](($FilteredFiles | Measure-Object -Property Length -Sum).Sum)
+                }
             }
+
+            # Process smallest jobs first: on a tight disk each completed job frees source space,
+            # and once one job does not fit, no larger one will either.
+            $Jobs = @($Jobs | Sort-Object SizeBytes)
 
             Add-LogMessage "Ending job generation. Jobs to process: $($Jobs.Count)" INFO
             ############## End jobs generation ##############
@@ -284,8 +404,12 @@ try {
             ############## Start jobs execution ##############
             foreach ($Job in $Jobs) {
                 # Job Try
-                try {                    
-                    ############## Start job execution ##############                    
+                try {
+                    ############## Start job execution ##############
+                    # Conservative default for the catch block: only a freshly-created partial archive
+                    # is safe to delete on failure; an archive that already existed must be preserved.
+                    $ArchiveExistedBefore = $true
+
                     $BackupDate = [DateTime]::ParseExact($Job.BackupDate, $StandardDateFormat, $InvariantCulture)
                     $DateFormat = if (-not [string]::IsNullOrWhiteSpace($Rule.DateFormat)) { $Rule.DateFormat } else { $StandardDateFormat }
                     $Timestamp = $BackupDate.ToString($DateFormat, $InvariantCulture)
@@ -294,6 +418,42 @@ try {
                     $Suffix = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNameSuffix)) { "_$($Rule.ArchiveNameSuffix)" } else { "" }
                     $ArchiveName = "$Prefix$($env:COMPUTERNAME)_$Timestamp$Suffix.zip"
                     $ArchiveFullPath = Join-Path -Path $Rule.DestinationPath -ChildPath $ArchiveName
+
+                    ############## Start free-space pre-flight ##############
+                    # Estimate required space and verify the volume(s) can hold it before staging anything.
+                    $ExpectedReductionPct = if ($null -ne $Rule.ExpectedCompressionPercent) { [int]$Rule.ExpectedCompressionPercent } else { 0 }
+                    $EstimatedArchiveBytes = [int64]($Job.SizeBytes * (1 - $ExpectedReductionPct / 100.0))
+
+                    # If today's archive already exists, 7-Zip rewrites it on update -> reserve its current size.
+                    $ArchiveExistedBefore = Test-Path -Path $ArchiveFullPath -PathType Leaf
+                    $ExistingArchiveBytes = if ($ArchiveExistedBefore) { (Get-Item -LiteralPath $ArchiveFullPath).Length } else { 0 }
+
+                    # Required space per volume root:
+                    #   destination: estimated archive + rewrite headroom + static buffer
+                    #   source (keep mode only): full uncompressed temp copy living alongside the originals
+                    $DestRoot = [System.IO.Path]::GetPathRoot((Resolve-Path -Path $Rule.DestinationPath).Path)
+                    $SourceRoot = [System.IO.Path]::GetPathRoot((Resolve-Path -Path $Rule.SourcePath).Path)
+                    $Requirements = @{ $DestRoot = ($EstimatedArchiveBytes + $ExistingArchiveBytes + $SpaceSafetyBufferBytes) }
+                    if (-not $Rule.CleanSourceFiles) {
+                        if ($Requirements.ContainsKey($SourceRoot)) { $Requirements[$SourceRoot] += $Job.SizeBytes }
+                        else { $Requirements[$SourceRoot] = $Job.SizeBytes }
+                    }
+
+                    $SpaceOk = $true
+                    foreach ($Root in @($Requirements.Keys)) {
+                        try { $FreeBytes = (New-Object System.IO.DriveInfo($Root)).AvailableFreeSpace }
+                        catch {
+                            Add-LogMessage "Could not determine free space on '$Root'. Proceeding without pre-flight check. Error: $($_.Exception.Message)" WARN
+                            continue
+                        }
+                        if ($FreeBytes -lt $Requirements[$Root]) {
+                            Add-LogMessage "Insufficient disk space on '$Root' for job '$($Job.Name)': need ~$([math]::Round($Requirements[$Root] / 1MB, 1)) MB, free $([math]::Round($FreeBytes / 1MB, 1)) MB. Skipping this and all larger remaining jobs in this rule." ERROR
+                            $SpaceOk = $false
+                        }
+                    }
+                    # Jobs are sorted ascending by size, so nothing larger will fit either.
+                    if (-not $SpaceOk) { break }
+                    ############## End free-space pre-flight ##############
 
                     # There are 2 types of jobs: KEEP or DELETE source files
                     Add-LogMessage "Starting Job: '$($Job.Name)'" INFO
@@ -304,31 +464,57 @@ try {
                     $TmpContainerDirPath = Join-Path -Path $Rule.SourcePath -ChildPath "$Prefix$($env:COMPUTERNAME)_$Timestamp"
                     New-Item -Path $TmpContainerDirPath -ItemType Directory -Force
 
+                    # Stage files into the temp container directory (move vs copy depends on the rule).
                     switch ($Rule.CleanSourceFiles) {
                         $true {
-                            Add-LogMessage "Rule name: '$($Rule.Name)'. Clean source files" INFO
-                            # Move target files to it
-                            Move-Item -Path $FilePaths -Destination $TmpContainerDirPath -Force -ErrorAction Stop
-                            # Compress that directory with remove src flag
-                            & $ZipPath $ZipArgumentsSDel $ArchiveFullPath (Join-Path $TmpContainerDirPath "*")
-                            if ($LASTEXITCODE -ge 2) { throw "7-Zip process failed with exit code $LASTEXITCODE for archive '$ArchiveFullPath'." }
-                            if (-not (Test-Path -Path $ArchiveFullPath -PathType Leaf)) { throw "7-Zip completed but archive was not created at '$ArchiveFullPath'." }
-                            # remove empty TMP directory
-                            if (Test-Path -Path $TmpContainerDirPath) { Remove-Item -Path $TmpContainerDirPath -Force -ErrorAction SilentlyContinue }
+                            Add-LogMessage "Rule '$($Rule.Name)': clean source files mode (originals removed after archiving)." INFO
+                            # Move target files one by one with fallback to copy if locked
+                            foreach ($FilePath in $FilePaths) {
+                                $DestFilePath = Join-Path $TmpContainerDirPath (Split-Path $FilePath -Leaf)
+                                try {
+                                    [System.IO.File]::Move($FilePath, $DestFilePath)
+                                }
+                                catch {
+                                    Add-LogMessage "File '$FilePath' is locked. Attempting to copy instead..." WARN
+                                    try {
+                                        [System.IO.File]::Copy($FilePath, $DestFilePath, $true)
+                                    }
+                                    catch {
+                                        throw "Failed to move or copy locked file '$FilePath'. Error: $($_.Exception.Message)"
+                                    }
+                                }
+                            }
                         }
                         $false {
-                            Add-LogMessage "Rule name: '$($Rule.Name)'. Keep source files" INFO
+                            Add-LogMessage "Rule '$($Rule.Name)': keep source files mode (originals preserved)." INFO
                             # Copy files to TMP directory
-                            Copy-Item -LiteralPath $FilePaths -Destination $TmpContainerDirPath -Force -ErrorAction Stop
-                            # Compress that directory with remove src flag
-                            & $ZipPath $ZipArgumentsSDel $ArchiveFullPath (Join-Path $TmpContainerDirPath "*")
-                            if ($LASTEXITCODE -ge 2) { throw "7-Zip process failed with exit code $LASTEXITCODE for archive '$ArchiveFullPath'." }
-                            if (-not (Test-Path -Path $ArchiveFullPath -PathType Leaf)) { throw "7-Zip completed but archive was not created at '$ArchiveFullPath'." }
-                            # remove TMP directory
-                            if (Test-Path -Path $TmpContainerDirPath) { Remove-Item -Path $TmpContainerDirPath -Force -ErrorAction SilentlyContinue }
+                            foreach ($FilePath in $FilePaths) {
+                                try {
+                                    [System.IO.File]::Copy($FilePath, (Join-Path $TmpContainerDirPath (Split-Path $FilePath -Leaf)), $true)
+                                }
+                                catch {
+                                    throw "Failed to copy file '$FilePath'. Error: $($_.Exception.Message)"
+                                }
+                            }
                         }
-                        Default { Add-LogMessage "Rule name: '$($Rule.Name)'. Unknown configuration for the 'CleanSourceFiles' key." ERROR; continue }
+                        Default { throw "Unknown configuration for the 'CleanSourceFiles' key in rule '$($Rule.Name)'." }
                     }
+
+                    # Compress the staged files. -sdel is intentionally NOT used: the staged copies must
+                    # survive until the archive passes its integrity test, so a failed/corrupt archive
+                    # leaves the temp dir intact for the leftover-recovery pass on the next run.
+                    $Level = if ($null -ne $Rule.CompressionLevel) { [int]$Rule.CompressionLevel } else { $DefaultCompressionLevel }
+                    $ZipAddArgs = @('a', '-tzip', '-mm=Deflate', "-mx=$Level")
+                    & $ZipPath $ZipAddArgs $ArchiveFullPath (Join-Path $TmpContainerDirPath "*")
+                    if ($LASTEXITCODE -ge 2) { throw "7-Zip process failed with exit code $LASTEXITCODE for archive '$ArchiveFullPath'." }
+                    if (-not (Test-Path -Path $ArchiveFullPath -PathType Leaf)) { throw "7-Zip completed but archive was not created at '$ArchiveFullPath'." }
+
+                    # Verify archive integrity BEFORE deleting the staged source files.
+                    & $ZipPath t $ArchiveFullPath
+                    if ($LASTEXITCODE -ne 0) { throw "Archive integrity test failed with exit code $LASTEXITCODE for '$ArchiveFullPath'." }
+
+                    # Archive verified: it is now safe to remove the staged files.
+                    if (Test-Path -Path $TmpContainerDirPath) { Remove-Item -Path $TmpContainerDirPath -Force -Recurse -ErrorAction SilentlyContinue }
 
                     ############## End job execution ##############
 
@@ -347,7 +533,13 @@ try {
                 }
                 # Job Catch
                 catch {
-                    Add-LogMessage "ERROR Job: '$($Job.Name)'. Error: $_" ERROR
+                    Add-LogMessage "Job '$($Job.Name)' failed. Error: $_" ERROR
+                    # Remove a partial archive only if this job created it (preserve a pre-existing one
+                    # that may already hold data from an earlier run on the same day).
+                    if (-not $ArchiveExistedBefore -and (Test-Path -Path $ArchiveFullPath -PathType Leaf)) {
+                        Add-LogMessage "Removing partial archive '$ArchiveFullPath' left by the failed job." WARN
+                        Remove-Item -Path $ArchiveFullPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
                 # Job Finally
                 finally {
@@ -357,18 +549,29 @@ try {
             ############## End jobs execution ##############
         }
         # Rule catch
-        catch { Add-LogMessage "Failed to process rule: '$($Rule.Name)'. Error: $_" WARN }
+        catch { Add-LogMessage "Failed to process rule: '$($Rule.Name)'. Error: $_" ERROR }
         # Rule finally
         finally { Add-LogMessage "Finished rule: '$($Rule.Name)'" INFO }
     }
     ############## End rules processing ##############
 }
 # global catch
-catch { throw "Critical Error: Script cannot continue. Error: $_" }
+catch { Add-LogMessage "CRITICAL: Unhandled error. Script cannot continue. Error: $_" ERROR }
 # global finally
 finally {
-    ############## Stop logger ##############
-    try { Add-LogMessage "Stopping Script" INFO }
-    finally { Write-Host "Stopping Script" }    
+    ############## Finalize: write summary, set exit code, stop logger ##############
+    $Stats = Get-LogStats
+    if ($Stats.Errors -gt 0) {
+        Add-LogMessage "Script finished with $($Stats.Errors) error(s) and $($Stats.Warnings) warning(s)." ERROR
+    }
+    elseif ($Stats.Warnings -gt 0) {
+        Add-LogMessage "Script finished with $($Stats.Warnings) warning(s)." WARN
+    }
+    else {
+        Add-LogMessage "Script finished successfully." INFO
+    }
+    Add-LogMessage "Stopping Script" INFO
     Stop-LogProcessor
+    if ($Stats.Errors -gt 0) { exit 2 }
+    elseif ($Stats.Warnings -gt 0) { exit 1 }
 }

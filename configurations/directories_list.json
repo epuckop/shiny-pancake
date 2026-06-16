@@ -8,6 +8,8 @@
         "ArchiveNamePrefix": "Logs",
         "ArchiveNameSuffix": "PROD",
         "DateFormat": "dd-MM-yy",
+        "CompressionLevel": 9,
+        "ExpectedCompressionPercent": 90,
         "CleanSourceFiles": true,
         "Mandatory": false
     },
