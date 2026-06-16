@@ -43,6 +43,10 @@ $ErrorActionPreference = 'Stop'
 $InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
 $Rng = New-Object System.Random
 
+# Anchor for relative paths from the config, so generated files and their destination folders all
+# land under the project (the same anchor as the default -OutputRoot), regardless of the caller's CWD.
+$ProjectRoot = Split-Path $PSScriptRoot -Parent
+
 # Build a filename that satisfies the regex by de-regexing it and inserting a unique token at the
 # first wildcard position. Returns a best-effort candidate; the caller verifies it with -match.
 function New-NameFromPattern {
@@ -101,13 +105,15 @@ foreach ($Rule in $Rules) {
     if (-not (Test-Path -Path $RuleDir)) { New-Item -ItemType Directory -Path $RuleDir -Force | Out-Null }
 
     # Create the rule's DestinationPath too, so the archiver (which does NOT create it) can run
-    # straight after seeding. Resolved against the current directory, same as main.ps1 will resolve it.
-    if (-not [string]::IsNullOrWhiteSpace($Rule.DestinationPath) -and -not (Test-Path -Path $Rule.DestinationPath)) {
-        New-Item -ItemType Directory -Path $Rule.DestinationPath -Force | Out-Null
-    }
+    # straight after seeding. Relative paths are anchored to the project root (same as the source
+    # files), so the archive folder always lands beside them no matter where the seeder is run from.
+    $DestPath = if ([string]::IsNullOrWhiteSpace($Rule.DestinationPath)) { '' }
+    elseif ([System.IO.Path]::IsPathRooted($Rule.DestinationPath)) { $Rule.DestinationPath }
+    else { Join-Path $ProjectRoot $Rule.DestinationPath }
+    if ($DestPath -and -not (Test-Path -Path $DestPath)) { New-Item -ItemType Directory -Path $DestPath -Force | Out-Null }
 
     $Mode = if ($Rule.CleanSourceFiles) { 'rotation (date-spread)' } else { 'keep (flat filler)' }
-    Write-Host "Rule '$RuleName' [$Mode] -> $RuleDir  (dest: '$($Rule.DestinationPath)', pattern: '$($Rule.FileNamePattern)')"
+    Write-Host "Rule '$RuleName' [$Mode] -> $RuleDir  (dest: '$DestPath', pattern: '$($Rule.FileNamePattern)')"
 
     $created = 0
     $seen = New-Object 'System.Collections.Generic.HashSet[string]'
