@@ -361,12 +361,14 @@ try {
                     $BackupDateName = [DateTime]::ParseExact($DateGroup.Name, $StandardDateFormat, $InvariantCulture)
                     $JobName = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { "$($Rule.ArchiveNamePrefix)_$($BackupDateName.ToString($StandardDateFormat))" } else { "$($Rule.Name)_$($BackupDateName.ToString($StandardDateFormat))" }
 
-                    $FilesToStageWithInfo = @()
+                    # List + .Add() instead of '+=' so building this scales linearly (a day can hold
+                    # thousands of files; '+=' reallocates the whole array on every item -> O(n^2)).
+                    $FilesToStageWithInfo = New-Object 'System.Collections.Generic.List[object]'
                     foreach ($File in $DateGroup.Group) {
-                        $FilesToStageWithInfo += [pscustomobject]@{
-                            Name             = $File.Name
-                            LastWriteTimeUtc = $File.LastWriteTimeUtc.ToString('o')
-                        }                            
+                        $FilesToStageWithInfo.Add([pscustomobject]@{
+                                Name             = $File.Name
+                                LastWriteTimeUtc = $File.LastWriteTimeUtc.ToString('o')
+                            })
                     }
 
                     $Jobs += [pscustomobject]@{
@@ -387,12 +389,13 @@ try {
                 $JobName = if (-not [string]::IsNullOrWhiteSpace($Rule.ArchiveNamePrefix)) { $Rule.ArchiveNamePrefix } else { $Rule.Name }
                 $BackupDateString = (Get-Date).ToString($StandardDateFormat, $InvariantCulture)
 
-                $FilesToStageWithInfo = @()
+                # List + .Add() instead of '+=' (see the rotation branch above) for linear scaling.
+                $FilesToStageWithInfo = New-Object 'System.Collections.Generic.List[object]'
                 foreach ($File in $FilteredFiles) {
-                    $FilesToStageWithInfo += [pscustomobject]@{
-                        Name             = $File.Name
-                        LastWriteTimeUtc = $File.LastWriteTimeUtc.ToString('o')
-                    }                            
+                    $FilesToStageWithInfo.Add([pscustomobject]@{
+                            Name             = $File.Name
+                            LastWriteTimeUtc = $File.LastWriteTimeUtc.ToString('o')
+                        })
                 }
 
                 $Jobs += [pscustomobject]@{
@@ -473,7 +476,8 @@ try {
                     # There are 2 types of jobs: KEEP or DELETE source files
                     Add-LogMessage "Starting Job: '$($Job.Name)'" INFO
 
-                    $FilePaths = $Job.Files | ForEach-Object { $_.FullName }
+                    # Member enumeration is much cheaper than piping each item through ForEach-Object.
+                    $FilePaths = @($Job.Files.FullName)
 
                     # Create TMP container directory for copy/move files.
                     $TmpContainerDirPath = Join-Path -Path $Rule.SourcePath -ChildPath $ArchiveBaseName
