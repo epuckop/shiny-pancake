@@ -49,12 +49,16 @@ The script mirrors how the archiver treats each rule:
 
 ### Using the output
 
-After seeding, point a test config's `SourcePath` at the generated folder, e.g.
-`testdata\Documents`, then run the archiver:
+The bundled config already points each rule's `SourcePath` at `testdata\<rule>`, so after seeding you
+can run the archiver straight away. The seeder also creates each rule's `DestinationPath` (the archiver
+does **not** create it), so no manual setup is needed:
 
 ```powershell
-.\main.ps1 -JsonConfigPath .\configurations\polygon.json
+.\tools\seed-testdata.ps1   # generates source files AND creates destination folders
+.\main.ps1                  # run from the project root (paths are relative to the current directory)
 ```
+
+> Both scripts resolve relative paths against the current directory, so run them from the project root.
 
 ### Notes
 

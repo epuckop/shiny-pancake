@@ -100,8 +100,14 @@ foreach ($Rule in $Rules) {
     $RuleDir = Join-Path $OutputRoot $SafeName
     if (-not (Test-Path -Path $RuleDir)) { New-Item -ItemType Directory -Path $RuleDir -Force | Out-Null }
 
+    # Create the rule's DestinationPath too, so the archiver (which does NOT create it) can run
+    # straight after seeding. Resolved against the current directory, same as main.ps1 will resolve it.
+    if (-not [string]::IsNullOrWhiteSpace($Rule.DestinationPath) -and -not (Test-Path -Path $Rule.DestinationPath)) {
+        New-Item -ItemType Directory -Path $Rule.DestinationPath -Force | Out-Null
+    }
+
     $Mode = if ($Rule.CleanSourceFiles) { 'rotation (date-spread)' } else { 'keep (flat filler)' }
-    Write-Host "Rule '$RuleName' [$Mode] -> $RuleDir  (pattern: '$($Rule.FileNamePattern)')"
+    Write-Host "Rule '$RuleName' [$Mode] -> $RuleDir  (dest: '$($Rule.DestinationPath)', pattern: '$($Rule.FileNamePattern)')"
 
     $created = 0
     $seen = New-Object 'System.Collections.Generic.HashSet[string]'
