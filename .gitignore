@@ -4,3 +4,6 @@
 # Script output
 logs/
 receipt/
+
+# Generated test data (tools/seed-testdata.ps1)
+testdata/
