@@ -40,7 +40,7 @@ $InvariantCulture = [System.Globalization.CultureInfo]::InvariantCulture
 $StandardDateFormat = 'dd-MM-yy'
 
 # --- 7-Zip Configuration ---
-$ZipPath = (Join-Path $PSScriptRoot "bin\7zip\7za.exe")
+$ZipPath = (Join-Path $PSScriptRoot "bin\7zip\x64\7za.exe")
 # Default 7-Zip compression level (0-9). Overridable per-rule via 'CompressionLevel' in the config.
 $DefaultCompressionLevel = 5
 
