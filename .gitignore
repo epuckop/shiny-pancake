@@ -1,9 +1,16 @@
 # macOS
 .DS_Store
 
+# agents
+.agents/
+.claude/
+
 # Script output
 logs/
 receipt/
 
 # Generated test data (tools/seed-testdata.ps1)
 testdata/
+
+# graphify knowledge-graph output
+graphify-out/

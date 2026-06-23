@@ -1,589 +1,281 @@
-# Log Rotation & Archiving Script — Design Document
+# Log Rotation & Archiving Script — System Architecture & Design
 
-## 1. System Overview
+This document describes the **system architecture, design patterns, and internal mechanisms** of the log rotation and archiving script. It covers the structure of the system, data models, and key architectural decisions. 
 
-This PowerShell script automates the rotation and archival of log files. It reads rules from a JSON configuration, discovers matching files, groups them (optionally by date), compresses them into ZIP archives via 7-Zip, and writes JSON receipts for auditability.
+For the step-by-step logic, decision branching, and flowcharts, see the companion [FLOWCHARTS.md](FLOWCHARTS.md).
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      shiny-pancake                             │
-│                                                                 │
-│  ┌──────────────────┐     ┌──────────────┐     ┌──────────┐   │
-│  │ configurations/  │     │   modules/   │     │ bin/     │   │
-│  │                  │     │              │     │          │   │
-│  │ directories_     │     │ logger/      │     │ 7zip/    │   │
-│  │ list.json        │     │ fileimport/  │     │  7za.exe │   │
-│  └────────┬─────────┘     └──────────────┘     └──────────┘   │
-│           │                                                     │
-│           ▼                                                     │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │                    main.ps1                              │  │
-│  │                                                          │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌────────────────┐  │  │
-│  │  │ Phase 1:    │  │ Phase 2:    │  │ Phase 3:       │  │  │
-│  │  │ Prereqs     │→ │ Rules       │→ │ Cleanup        │  │  │
-│  │  │ Validation  │  │ Processing  │  │ (Stop Logger)  │  │  │
-│  │  └─────────────┘  └─────────────┘  └────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│           │                                                     │
-│           ▼                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐    │
-│  │   logs/      │  │  receipt/    │  │  DestinationPath │    │
-│  │              │  │              │  │  (per rule)      │    │
-│  │ log_YYYY-    │  │ YYYY-MM-DD/  │  │                  │    │
-│  │ MM-DD.log    │  │              │  │ *.zip archives   │    │
-│  └──────────────┘  └──────────────┘  └──────────────────┘    │
-└─────────────────────────────────────────────────────────────────┘
+---
+
+## 1. System Context
+
+The script operates as a standalone utility, typically executed by an external scheduler (e.g., Windows Task Scheduler, SQL Server Agent, or cron-like triggers). The scheduler drives execution, while the script reports results back via standard streams and a deterministic exit code.
+
+```mermaid
+%%{init: {'theme': 'neutral', 'themeVariables': { 'fontFamily': 'Segoe UI, system-ui, -apple-system, sans-serif' }}}%%
+flowchart TD
+    classDef sched fill:#f5f5f5,stroke:#666,stroke-width:1.5px,stroke-dasharray: 3 3,color:#333;
+    classDef main fill:#d2e5ff,stroke:#0052cc,stroke-width:2px,color:#003366;
+    classDef tool fill:#fff2cc,stroke:#d6b656,stroke-width:1.5px,color:#665c00;
+    classDef storage fill:#d5e8d4,stroke:#82b366,stroke-width:2px,color:#274e13;
+
+    sched["External Scheduler<br/>(Task Scheduler / SQL Agent)"]
+    subgraph AppContainer [" shiny-pancake System Boundary "]
+        main["Log Archiver<br/>(main.ps1)"]
+    end
+    src[("Source Log Directories<br/>(Original logs)")]
+    zip["7-Zip Utility<br/>(7za.exe)"]
+    out[("Output Directories<br/>(receipt/ · logs/ · archives/)")]
+
+    sched -->|1. Triggers execution &<br/>reads exit code| main
+    src -.->|2. Reads files| main
+    main -.->|3. Compresses & Verifies| zip
+    main -->|4. Writes archives & receipts| out
+
+    class sched sched;
+    class main main;
+    class zip tool;
+    class src,out storage;
 ```
 
 ---
 
-## 2. Execution Flow
+## 2. Container Architecture
 
-### 2.1 Top-Level Flow
+The system consists of three internal components and two external interfaces:
 
-```
-START
-  │
-  ├─► Load Parameters (JsonConfigPath, LogFile)
-  │
-  ├─► Import Modules
-  │     ├─ modules/logger (async log processor)
-  │     └─ modules/fileimport (JSON reader)
-  │
-  ├─► Start-LogProcessor
-  │
-  ├─► PHASE 1: Prerequisites Validation
-  │     │
-  │     ├─► Test-Path 7za.exe ?
-  │     │     ├─ NO → ERROR + throw
-  │     │     └─ YES → run 7za.exe, check exit code
-  │     │
-  │     ├─► Get-JsonContent (load config)
-  │     │     ├─ FAIL → ERROR + throw
-  │     │     └─ OK  → continue
-  │     │
-  │     ├─► Validate Config
-  │     │     ├─ Required fields present?
-  │     │     ├─ No invalid filename chars?
-  │     │     ├─ DateFormat valid?
-  │     │     └─ FileNamePattern valid regex?
-  │     │           ├─ FAIL → ERROR + throw
-  │     │           └─ OK  → continue
-  │     │
-  │     └─► New-Item receipt/YYYY-MM-DD
-  │
-  ├─► PHASE 2: Rules Processing (foreach rule)
-  │     │
-  │     ├─► Rule Prerequisites
-  │     │     ├─ SourcePath exists?
-  │     │     ├─ DestinationPath exists?
-  │     │     ├─ Leftover recovery (archive+verify orphaned temp dirs)
-  │     │     ├─ Files found?
-  │     │     └─ Apply FileNamePattern filter
-  │     │
-  │     ├─► Job Generation
-  │     │     │
-  │     │     ├─ CleanSourceFiles == true?
-  │     │     │     ├─ YES → Exclude today's files
-  │     │     │     │       Group by LastWriteTime date
-  │     │     │     │       One job per date group
-  │     │     │     │
-  │     │     ├─ NO → One job for all files
-  │     │     └─ Sort jobs ascending by size
-  │     │
-  │     └─► Job Execution (foreach job, smallest first)
-  │           ├─ Free-space pre-flight (skip if it won't fit)
-  │           ├─ Build archive name
-  │           ├─ Create temp dir
-  │           ├─ Move/Copy files → temp dir (.NET File API)
-  │           ├─ 7za a compress  →  7za t verify
-  │           ├─ Remove temp dir (only after verify)
-  │           └─ Write JSON receipt
-  │
-  └─► PHASE 3: Cleanup
-        ├─► Write summary + compute exit code (0/1/2)
-        └─► Stop-LogProcessor
+```mermaid
+%%{init: {'theme': 'neutral', 'themeVariables': { 'fontFamily': 'Segoe UI, system-ui, -apple-system, sans-serif' }}}%%
+flowchart TD
+    classDef external fill:#f5f5f5,stroke:#666,stroke-width:1.5px,stroke-dasharray: 3 3,color:#333;
+    classDef orchestrator fill:#d2e5ff,stroke:#0052cc,stroke-width:2px,color:#003366;
+    classDef module fill:#e1f5fe,stroke:#0288d1,stroke-width:1.5px,color:#01579b;
+    classDef tool fill:#fff2cc,stroke:#d6b656,stroke-width:1.5px,color:#665c00;
+    classDef storage fill:#d5e8d4,stroke:#82b366,stroke-width:2px,color:#274e13;
+
+    sched["External Scheduler<br/>(Triggers execution)"]
+    config[("directories_list.json<br/>(JSON Rules)")]
+    zip["7za.exe<br/>(7-Zip Engine)"]
+    
+    subgraph AppBoundary [" shiny-pancake (Application Scope) "]
+        main["main.ps1<br/>(Orchestrator Container)"]
+        fileimport["modules/fileimport<br/>(JSON Loader)"]
+        logger["modules/logger<br/>(Async Logger Module)"]
+    end
+
+    subgraph FileStorage [" Local File System "]
+        src[("Source Directories<br/>(Original logs)")]
+        out[("Output Storage<br/>(archives/ · logs/ · receipt/)")]
+    end
+
+    sched -->|1. Executes & reads exit code| main
+    main -->|2. Get-JsonContent| fileimport
+    fileimport -->|3. Reads configuration| config
+    main -->|4. Add-LogMessage| logger
+    logger -->|5. Writes async logs| out
+    main -.->|6. Stages files| src
+    main -.->|7. Compresses & tests| zip
+    main -->|8. Writes zip & receipts| out
+
+    class sched,config external;
+    class main orchestrator;
+    class fileimport,logger module;
+    class zip tool;
+    class src,out storage;
 ```
 
-### 2.2 Detailed Rule Processing Flow
+### Components
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   Rule Processing                    │
-│                                                      │
-│  ┌──────────────────────┐                           │
-│  │  Load Rule Config    │                           │
-│  └──────────┬───────────┘                           │
-│             │                                        │
-│             ▼                                        │
-│  ┌──────────────────────┐    NO     ┌────────────┐  │
-│  │ SourcePath exists?   │──────────►│ WARN +     │  │
-│  └──────────┬───────────┘           │ SKIP RULE  │  │
-│             │ YES                    └────────────┘  │
-│             │                                        │
-│             ▼                                        │
-│  ┌──────────────────────┐    NO     ┌────────────┐  │
-│  │DestPath exists?      │──────────►│ ERROR +    │  │
-│  └──────────┬───────────┘           │ SKIP RULE  │  │
-│             │ YES                    └────────────┘  │
-│             │                                        │
-│             ▼                                        │
-│  ┌──────────────────────┐                           │
-│  │ Get-ChildItem files  │                           │
-│  └──────────┬───────────┘                           │
-│             │                                        │
-│             ▼                                        │
-│  ┌──────────────────────┐    NO     ┌────────────┐  │
-│  │ Files found?         │──────────►│ Mandatory? │  │
-│  └──────────┬───────────┘           │            │  │
-│             │ YES                    │ YES → ERR  │  │
-│             │                        │ NO  → INF  │  │
-│             │                        └─────┬──────┘  │
-│             │                              │         │
-│             ▼                              ▼         │
-│  ┌──────────────────────┐    ┌──────────────────┐   │
-│  │ Apply FileNamePattern│    │ All files kept   │   │
-│  │ (regex filter)       │    └────────┬─────────┘   │
-│  └──────────┬───────────┘             │             │
-│             │                          ▼             │
-│             │              ┌──────────────────┐     │
-│             │              │ Job Generation    │     │
-│             │              └────────┬─────────┘     │
-│             │                       │               │
-│             │              ┌────────┴─────────┐     │
-│             │              │                  │     │
-│             │     CleanSourceFiles   NOT       │     │
-│             │          = true         = false   │     │
-│             │              │                  │     │
-│             │              ▼                  ▼     │
-│             │     ┌──────────────┐  ┌──────────┐   │
-│             │     │ Exclude today│  │ Single   │   │
-│             │     │ files        │  │ Job      │   │
-│             │     │              │  │          │   │
-│             │     │ Group by     │  │          │   │
-│             │     │ date         │  │          │   │
-│             │     │              │  │          │   │
-│             │     │ N Jobs       │  │ 1 Job    │   │
-│             │     └──────┬───────┘  └──────────┘   │
-│             │            │                           │
-│             ▼            ▼                           │
-│  ┌──────────────────────────────────────┐           │
-│  │  For Each Job:                       │           │
-│  │                                      │           │
-│  │  1. Build ArchiveName                │           │
-│  │     <Prefix>_<COMPUTERNAME>_<date>   │           │
-│  │     <Suffix>.zip                      │           │
-│  │                                      │           │
-│  │  2. Create temp dir in SourcePath    │           │
-│  │                                      │           │
-│  │  3. Free-space pre-flight check      │           │
-│  │                                      │           │
-│  │  4. Move/Copy files → temp dir       │           │
-│  │     (.NET File API)                  │           │
-│  │                                      │           │
-│  │  5. 7za a <archive> * → 7za t verify │           │
-│  │     remove temp dir after verify     │           │
-│  │                                      │           │
-│  │  6. Write JSON receipt               │           │
-│  └──────────────────────────────────────┘           │
-└─────────────────────────────────────────────────────┘
-```
+*   **`main.ps1` (Orchestrator)**: The script's entry point. It manages prerequisites verification, resource throttling, rule evaluation, job scheduling, execution pre-flights, staging, compression invocation, integrity validation, cleanup, and receipt generation.
+*   **`modules/logger` (Async Logger)**: Implements a thread-safe producer-consumer logging model. Logging actions run asynchronously in a background runspace to prevent disk I/O bottlenecks from blocking the main orchestrator loop.
+*   **`modules/fileimport` (JSON Loader)**: Houses `Get-JsonContent`, which reads raw file content using UTF-8 encoding and converts it into structured PowerShell objects (`ConvertFrom-Json`).
+*   **`bin/7zip/7za.exe` (External Binary)**: Standalone 7-Zip command-line executable. Chosen for its portable nature, high compression ratio, and built-in integrity testing (`t` command).
 
 ---
 
-## 3. Architecture Diagram
+## 3. Resource Throttling & Affinity Masking
 
+To ensure the script does not starve the host system's CPU and memory, the script features a best-effort resource throttling system. It lowers process priority and calculates a CPU affinity mask.
+
+### Bitwise Affinity Calculation
+
+The script limits CPU cores by constructing a bitwise processor affinity mask using `[int64]` integers to maintain Windows PowerShell 4 compatibility:
+
+```text
+AllowedCores = max(1, floor(TotalCores * (CpuPercent / 100.0)))
+ShiftCores   = TotalCores - AllowedCores
+Mask         = (2^AllowedCores - 1) * 2^ShiftCores
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Component Architecture                        │
-│                                                                      │
-│  ┌──────────────┐    ┌──────────────────────────────────────────┐   │
-│  │   main.ps1   │    │              Orchestrator                │   │
-│  │              │    │                                          │   │
-│  │  - Params    │    │  ┌─────────────┐  ┌──────────────────┐  │   │
-│  │  - Settings  │────┼──►│ Prereqs     │  │ Rules Processor  │  │   │
-│  │  - Try/Catch │    │  │ Validator   │  │                  │  │   │
-│  └──────┬───────┘    │  └─────────────┘  │  ┌────┬────┬────┐│  │   │
-│         │            │                   │  │ R1 │ R2 │ R3 ││  │   │
-│         │            │                   │  └────┴────┴────┘│  │   │
-│         │            │                   │         │        │  │   │
-│         │            │                   │  ┌──────┴──────┐ │  │   │
-│         │            │                   │  │  Jobs       │ │  │   │
-│         │            │                   │  │  Generator  │ │  │   │
-│         │            │                   │  └──────┬──────┘ │  │   │
-│         │            │                   │         │        │  │   │
-│         │            │                   │  ┌──────┴──────┐ │  │   │
-│         │            │                   │  │  Job Runner │ │  │   │
-│         │            │                   │  └──────┬──────┘ │  │   │
-│         │            │                   └──────────┼───────┘  │   │
-│         │            │                              │          │   │
-│         │            │                   ┌──────────┼───────┐  │   │
-│         │            │                   │          │       │  │   │
-│         │            │         ┌─────────┴┐  ┌────┴────┐  │  │   │
-│         │            │         │  Logger  │  │ 7-Zip   │  │  │   │
-│         │            │         │ Provider │  │ Engine  │  │  │   │
-│         │            │         └──────────┘  └─────────┘  │  │   │
-│         │            │                                      │  │   │
-│         │            │         ┌──────────┐  ┌──────────┐ │  │   │
-│         │            │         │ Receipt  │  │ JSON     │ │  │   │
-│         │            │         │ Writer   │  │ Config   │ │  │   │
-│         │            │         └──────────┘  └──────────┘ │  │   │
-│         │            │                                      │  │   │
-│         │            └──────────────────────────────────────┘  │   │
-│         │                                                      │   │
-│         │            ┌──────────────────────────────────┐      │   │
-│         │            │         modules/                  │      │   │
-│         │            │                                  │      │   │
-│         │            │  ┌──────────────┐  ┌──────────┐ │      │   │
-│         │            │  │ logger/      │  │fileimport│ │      │   │
-│         │            │  │              │  │          │ │      │   │
-│         │            │  │ Start-Log    │  │Get-Json  │ │      │   │
-│         │            │  │ Processor    │  │Content   │ │      │   │
-│         │            │  │ Add-LogMsg   │  │          │ │      │   │
-│         │            │  │ Stop-LogProc │  │          │ │      │   │
-│         │            │  └──────────────┘  └──────────┘ │      │   │
-│         │            └──────────────────────────────────┘      │   │
-│         │                                                      │   │
-│         ▼                                                      │   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐    │   │
-│  │ logs/        │  │ receipt/     │  │ DestinationPath  │    │   │
-│  │              │  │              │  │ (per rule)       │    │   │
-│  │ log_YYYY-    │  │ YYYY-MM-DD/  │  │                  │    │   │
-│  │ MM-DD.log    │  │ *.json       │  │ *.zip            │    │   │
-│  └──────────────┘  └──────────────┘  └──────────────────┘    │   │
-└─────────────────────────────────────────────────────────────────────┘
-```
+
+These bitwise operations shift the active bits to the **highest indexed CPU cores**, leaving the lower-indexed cores (e.g., Core 0 and Core 1) free for operating system and foreground interactive tasks.
+
+### Process Priority Classes
+
+The process priority class is adjusted dynamically using the .NET `Diagnostics.Process` API. Supported values include:
+*   `Idle` (lowest impact)
+*   `BelowNormal` (default configuration)
+*   `Normal` (standard process execution)
+*   `AboveNormal`
+*   `High`
+
+> [!NOTE]
+> Throttling is applied on a **best-effort** basis. If the script is executed in an environment where permission restrictions prevent changing priority or affinity (e.g., restricted containers), the script logs a warning and proceeds with normal execution.
 
 ---
 
-## 4. Data Flow
+## 4. Data Model & Job Orchestration
 
-### 4.1 Config → Rules → Jobs
+The script parses the raw configuration rules and expands them into executable units of work called **Jobs**.
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     JSON Config (directories_list.json)           │
-│                                                                   │
-│  [                                                               │
-│    {                                                             │
-│      "Name": "App Logs",                                         │
-│      "SourcePath": "D:\\app\\logs",                              │
-│      "DestinationPath": "D:\\archives",                          │
-│      "ArchiveNamePrefix": "AppLog",                              │
-│      "ArchiveNameSuffix": "",                                    │
-│      "DateFormat": "dd-MM-yy",                                   │
-│      "FileNamePattern": ".*\\.log$",                             │
-│      "CleanSourceFiles": true,                                   │
-│      "Mandatory": false                                          │
-│    },                                                            │
-│    { ... }                                                       │
-│  ]                                                               │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    Parsed Rule Objects                            │
-│                                                                   │
-│  Rule {                            Rule {                        │
-│    Name = "App Logs"                Name = "System Logs"         │
-│    SourcePath = "D:\\app\\logs"     SourcePath = "D:\\sys\\logs" │
-│    DestPath = "D:\\archives"        DestPath = "D:\\archives"    │
-│    Prefix = "AppLog"                Prefix = "SysLog"            │
-│    Pattern = ".*\\.log$"            Pattern = ""                 │
-│    CleanSrc = true                  CleanSrc = false             │
-│    Mandatory = false                Mandatory = true             │
-│  }                                }                              │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    Discovered & Filtered Files                    │
-│                                                                   │
-│  Rule 1: "App Logs"                                              │
-│    SourcePath: D:\app\logs                                        │
-│    All files: app.log, error.log, debug.log, readme.txt          │
-│    Filtered: app.log, error.log, debug.log  (pattern match)      │
-│                                                                   │
-│  Rule 2: "System Logs"                                            │
-│    SourcePath: D:\sys\logs                                        │
-│    All files: sys1.log, sys2.log, sys3.log                       │
-│    Filtered: sys1.log, sys2.log, sys3.log  (no filter)           │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│                    Generated Jobs                                 │
-│                                                                   │
-│  Rule 1 (CleanSourceFiles=true):                                 │
-│    Files from 3 dates → 3 jobs                                   │
-│    ┌─────────────────────────────────────────────────────┐       │
-│    │ Job 1: AppLog_14-01-25                              │       │
-│    │   Files: app.log (14-01), error.log (14-01)        │       │
-│    └─────────────────────────────────────────────────────┘       │
-│    ┌─────────────────────────────────────────────────────┐       │
-│    │ Job 2: AppLog_13-01-25                              │       │
-│    │   Files: debug.log (13-01)                          │       │
-│    └─────────────────────────────────────────────────────┘       │
-│    ┌─────────────────────────────────────────────────────┐       │
-│    │ Job 3: AppLog_12-01-25                              │       │
-│    │   Files: app.log (12-01)                            │       │
-│    └─────────────────────────────────────────────────────┘       │
-│                                                                   │
-│  Rule 2 (CleanSourceFiles=false):                                │
-│    Single job for all files                                      │
-│    ┌─────────────────────────────────────────────────────┐       │
-│    │ Job 4: SysLog                                       │       │
-│    │   Files: sys1.log, sys2.log, sys3.log              │       │
-│    └─────────────────────────────────────────────────────┘       │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    cfg[("directories_list.json")] --> parse[Parse to Rule Objects]
+    parse --> perRule[["For Each Rule"]]
+    perRule --> disc[Discover Files in SourcePath]
+    disc --> filt[Filter by FileNamePattern]
+    filt --> clean{CleanSourceFiles?}
+    clean -->|true| excl[Exclude Today's Files<br/>Group by LastWriteTime]
+    excl --> jobsN[One Job Per Date Group]
+    clean -->|false| jobs1[Single Job, All Files]
+    jobsN --> sort[Sort Jobs by Size Ascending]
+    jobs1 --> sort
+    sort --> exec[Job Execution]
 ```
 
-### 4.2 Job Execution Data Flow
+### Rotation Mode (`CleanSourceFiles = $true`)
+*   **Today's Exclusion**: Files modified on the current calendar day are skipped. This avoids zipping files that are actively being written to by applications.
+*   **Date Grouping**: Files are grouped by their `LastWriteTime` date using the formatting string `dd-MM-yy`.
+*   **Multi-Job Generation**: The rule generates one independent job per unique date group.
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Single Job Execution                           │
-│                                                                   │
-│  Input: Job { Name, Files[], BackupDate, UTC }                   │
-│         Rule { SourcePath, DestPath, Prefix, Suffix, ... }       │
-│                                                                   │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 1. Compute Archive Name                                     │  │
-│  │    "AppLog_COMPUTERNAME_14-01-25.zip"                      │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                            │                                      │
-│                            ▼                                      │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 2. Create Temp Directory                                    │  │
-│  │    D:\app\logs\AppLog_COMPUTERNAME_14-01-25\               │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                            │                                      │
-│                            ▼                                      │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 3. Free-space pre-flight (skip job if it won't fit)         │  │
-│  │                                                             │  │
-│  │ 4. Transfer Files to Temp Dir (.NET File API)               │  │
-│  │                                                             │  │
-│  │  CleanSourceFiles = true:                                   │  │
-│  │    [IO.File]::Move app.log... → temp (copy fallback if      │  │
-│  │    locked; originals removed)                               │  │
-│  │                                                             │  │
-│  │  CleanSourceFiles = false:                                  │  │
-│  │    [IO.File]::Copy app.log... → temp (originals preserved)  │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                            │                                      │
-│                            ▼                                      │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 5. Compress, verify, then delete staged files               │  │
-│  │                                                             │  │
-│  │    7za a -tzip -mm=Deflate -mx=<CompressionLevel>          │  │
-│  │       D:\archives\AppLog_COMPUTERNAME_14-01-25.zip         │  │
-│  │       D:\app\logs\AppLog_COMPUTERNAME_14-01-25\*           │  │
-│  │                                                             │  │
-│  │    7za t <archive>   ← integrity test                       │  │
-│  │    only on success → remove temp dir (no -sdel)             │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                            │                                      │
-│                            ▼                                      │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │ 6. Generate Receipt JSON                                    │  │
-│  │                                                             │  │
-│  │    receipt/2025-01-15/AppLog_14-01-25_1736934000.json     │  │
-│  │    ┌─────────────────────────────────────────────────┐     │  │
-│  │    │ {                                               │     │  │
-│  │    │   "Name": "AppLog_14-01-25",                   │     │  │
-│  │    │   "UTC": "2025-01-15T10:30:00.0000000Z",       │     │  │
-│  │    │   "Archive": "D:\\archives\\...zip",            │     │  │
-│  │    │   "Files": [                                    │     │  │
-│  │    │     { "Name": "app.log", "LastWriteTimeUtc":   │     │  │
-│  │    │              "2025-01-14T08:00:00.0000000Z"},   │     │  │
-│  │    │     { "Name": "error.log", "LastWriteTimeUtc": │     │  │
-│  │    │              "2025-01-14T09:00:00.0000000Z"}    │     │  │
-│  │    │   ]                                             │     │  │
-│  │    │ }                                               │     │  │
-│  │    └─────────────────────────────────────────────────┘     │  │
-│  └────────────────────────┬───────────────────────────────────┘  │
-│                            │                                      │
-│                            ▼                                      │
-│  Output: Archive at DestPath, Receipt in receipt/YYYY-MM-DD/     │
-│          Originals: deleted (if CleanSourceFiles) or kept        │
-└──────────────────────────────────────────────────────────────────┘
-```
+### Keep Mode (`CleanSourceFiles = $false`)
+*   **Single-Job Generation**: All discovered files matching the pattern are processed together in a single job.
+*   **Current Date Suffix**: The archive is named after the current execution date.
+
+### Smallest-First Job Ordering
+Jobs within a rule are sorted in **ascending order of their uncompressed bytes** (`SizeBytes`). This ordering strategy provides two major advantages:
+1.  **Optimal Storage Recovery**: On space-constrained disks, processing smaller files first successfully clears source space (in rotation mode) faster.
+2.  **Early Termination**: If a small job fails the free-space check, it acts as a gate: larger jobs will also not fit and can be skipped immediately.
 
 ---
 
-## 5. Module Interaction Diagram
+## 5. Disk-Space Pre-Flight Calculations
 
+Before staging any files, the script performs a strict disk space check to prevent running out of space during compression (which could leave partial archives or corrupted structures).
+
+### Required Space Formulas
+
+*   **Destination Volume Requirements ($Req_{dest}$)**:
+```text
+Req_dest = EstimatedArchiveBytes + ExistingArchiveBytes + SpaceSafetyBufferBytes
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Module Interactions                            │
-│                                                                   │
-│  main.ps1                                                        │
-│    │                                                             │
-│    ├─── Import-Module logger ─────────────────────────┐         │
-│    │                                                  │         │
-│    │                                                  ▼         │
-│    │                                          ┌───────────────┐ │
-│    │                                          │  Start-Log   │ │
-│    │                                          │  Processor   │ │
-│    │                                          └───────┬─────┘ │
-│    │                                                  │         │
-│    │                                                  ▼         │
-│    │                                          ┌───────────────┐ │
-│    │                                          │ Async Logger  │ │
-│    │                                          │ (background   │ │
-│    │                                          │  runspace)    │ │
-│    │                                          └───────┬─────┘ │
-│    │                                                  │         │
-│    │                                                  ▼         │
-│    │                                          ┌───────────────┐ │
-│    │                                          │  Log File     │ │
-│    │                                          │  (disk write) │ │
-│    │                                          └───────────────┘ │
-│    │                                                  │         │
-│    │  Add-LogMessage ─────────────────────────────────┘         │
-│    │  (enqueue to background runspace)                          │
-│    │                                                             │
-│    ├─── Import-Module fileimport ────────────────────┐          │
-│    │                                                 │          │
-│    │                                                 ▼          │
-│    │                                          ┌───────────────┐  │
-│    │                                          │ Get-Json     │  │
-│    │                                          │ Content      │  │
-│    │                                          └───────┬─────┘  │
-│    │                                                  │          │
-│    │                                                  ▼          │
-│    │                                          ┌───────────────┐  │
-│    │                                          │ JSON Config  │  │
-│    │                                          │ File         │  │
-│    │                                          └───────────────┘  │
-│    │                                                             │
-│    └─── External: 7za.exe ──────────────────────────────────────┘
-│         (process spawn: 'a' compress, then 't' integrity test)   │
-└──────────────────────────────────────────────────────────────────┘
+    
+    *   `EstimatedArchiveBytes`: Calculated by applying `ExpectedCompressionPercent` to the total size of the job files:
+```text
+EstimatedArchiveBytes = JobBytes * (1 - ExpectedCompressionPercent / 100)
 ```
+    *   `ExistingArchiveBytes`: If an archive for the same target date already exists, 7-Zip will perform an update/append operation. The script must reserve space equal to the size of the existing archive since 7-Zip creates a temporary copy during updates.
+    *   `SpaceSafetyBufferBytes`: A static safety margin set to `256MB` by default.
+
+*   **Source Volume Requirements ($Req_{src}$)** (Only evaluated when `CleanSourceFiles = $false`):
+```text
+Req_src = JobBytes
+```
+    
+    *   In copy mode (Keep), files are duplicated to a temp folder residing under `SourcePath`. This requires enough space on the source disk to store a second copy of all files.
+    *   In move mode (Rotation), files are moved into the temp folder. Since the temp folder lives on the same volume, this metadata-only rename requires virtually $0$ bytes of additional disk space.
 
 ---
 
-## 6. Archive Naming Convention
+## 6. Staging, Compression, & Integrity Verification
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Archive Name Construction                      │
-│                                                                   │
-│  Pattern:                                                        │
-│  ┌──────────┐ ┌────────────┐ ┌──────────┐ ┌──────────┐         │
-│  │  Prefix  │ │ COMPU-     │ │  Date    │ │  Suffix  │         │
-│  │ (optional)│ │ TERNAME   │ │ (config) │ │(optional)│         │
-│  └────┬─────┘ └─────┬──────┘ └────┬─────┘ └────┬─────┘         │
-│       │             │             │            │                 │
-│       ▼             ▼             ▼            ▼                 │
-│  "AppLog"    "_WIN-SRV01_"   "_14-01-25_"    ""                 │
-│       │             │             │            │                 │
-│       └─────────────┴─────────────┴────────────┘                 │
-│                            │                                     │
-│                            ▼                                     │
-│                    "AppLog_WIN-SRV01_14-01-25.zip"              │
-│                                                                   │
-│  Date Format Options:                                            │
-│    Default: dd-MM-yy  →  14-01-25                               │
-│    Custom:  yyyyMMdd  →  20250114                               │
-│    Custom:  MMM-yy    →  Jan-25                                 │
-└──────────────────────────────────────────────────────────────────┘
-```
+To guarantee zero data loss, the staging and zipping flow is structured to isolate failures:
+
+1.  **Temp Directory Staging**: Files are placed in a directory named after the target archive base (e.g., `<prefix>_<COMPUTERNAME>_<date>_<suffix>`).
+    *   **Move Mode**: Files are moved via `[System.IO.File]::Move()`. If a file is locked, it falls back to copying and logs a warning.
+    *   **Copy Mode**: Files are copied via `[System.IO.File]::Copy()`.
+2.  **No Native Deletions during Archiving**: The script invokes `7za.exe` without the `-sdel` (source delete) flag. Deletion is managed entirely by PowerShell *after* validation.
+3.  **Working Directory Relativization**: Before zipping, the script temporarily changes the working directory (both PowerShell location and process CWD) to the temp directory. This forces 7-Zip to store files with **flat/bare filenames**, avoiding deep folder hierarchy pollution inside the zip.
+4.  **Integrity Gate**: Once zipping completes, the script runs `7za.exe t <Archive>` to verify archive integrity. Only when the test returns exit code `0` is the temp staging directory deleted.
+5.  **Rollback**: If compression fails or the integrity test returns a non-zero code, the temp directory is **left in place** on disk. This preserves the original staged logs and sets up the folder for crash recovery.
 
 ---
 
-## 7. Error Handling Strategy
+## 7. Crash Recovery (Leftover Temp Directories)
 
+When a run is aborted or interrupted (e.g., due to system power loss, process termination, or disk errors), a staging temp directory remains in the source path. The orchestrator automatically handles these during rule initialization:
+
+```mermaid
+flowchart TD
+    A[Start Rule] --> B[Scan SourcePath for Dirs matching Prefix_COMPUTERNAME_*]
+    B --> C{Any Leftover Dirs?}
+    C -->|No| D[Proceed with normal execution]
+    C -->|Yes| E[For each directory found]
+    E --> F{Is directory empty?}
+    F -->|Yes| G[Log warning & Delete dir]
+    F -->|No| H[Capture files metadata]
+    H --> I[Zip files to DestinationPath]
+    I --> J{Compression & Integrity OK?}
+    J -->|No| K[Log Error & Skip recovery for this dir]
+    J -->|Yes| L[Delete temp directory]
+    L --> M[Write Recovery Receipt with Recovered=true]
+    M --> N[Log success]
+    G --> O[Loop end]
+    K --> O
+    N --> O
+    O --> D
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    Error Handling Hierarchy                       │
-│                                                                   │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Global try/finally (main.ps1)                           │    │
-│  │  ┌────────────────────────────────────────────────────┐  │    │
-│  │  │  catch: log ERROR (does not re-throw)              │  │    │
-│  │  finally: write summary, compute exit code,        │  │    │
-│  │           Stop-LogProcessor                         │  │    │
-│  │  └────────────────────────────────────────────────────┘  │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Rule try/catch/finally                                  │    │
-│  │  ┌────────────────────────────────────────────────────┐  │    │
-│  │  │  catch: log ERROR, continue to next rule           │  │    │
-│  │  │  finally: log "Finished rule"                      │  │    │
-│  │  └────────────────────────────────────────────────────┘  │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                                                                    │
-│  ┌──────────────────────────────────────────────────────────┐    │
-│  │  Job try/catch/finally                                   │    │
-│  │  ┌────────────────────────────────────────────────────┐  │    │
-│  │  │  catch: log ERROR, remove fresh partial archive,   │  │    │
-│  │  │         skip this job                              │  │    │
-│  │  │  finally: log "Ending Job"                         │  │    │
-│  │  └────────────────────────────────────────────────────┘  │    │
-│  └──────────────────────────────────────────────────────────┘    │
-│                                                                    │
-│  Severity Levels:                                                │
-│    ERROR  →  log error; counts toward exit code 2               │
-│    WARN   →  log warning; counts toward exit code 1             │
-│    INFO   →  log informational message                          │
-│                                                                  │
-│  Exit codes (the only signal the external scheduler reads):     │
-│    0 = clean   1 = warnings only   2 = any errors               │
-│  Counts come from Get-LogStats; the global finally sets the     │
-│  code. Errors are logged, never re-thrown, so the process       │
-│  always exits deterministically (a missing module exits 2).     │
-└──────────────────────────────────────────────────────────────────┘
-```
+
+This recovery pass ensures that logs staged during a crashed execution are not lost, but are safely archived, verified, and cleaned up before new jobs begin.
 
 ---
 
-## 8. Key Design Decisions
+## 8. Error Isolation & Exit Code Mapping
 
-| Decision | Rationale |
-|---|---|
-| **Exclude today's files** when `CleanSourceFiles=true` | Prevents archiving files that are still being written to, avoiding corruption |
-| **Group by date** when `CleanSourceFiles=true` | Keeps archives organized by day, making restoration and auditing easier |
-| **Temp directory approach** | Single 7-Zip invocation is more efficient than per-file compression |
-| **Integrity test before delete** | Compress (no `-sdel`), run `7za t`, and only then delete the staged files. A failed/corrupt archive leaves the temp dir intact, so the next run's leftover-recovery pass salvages it — no data loss |
-| **Leftover recovery** | Temp dirs left by an interrupted run are detected, archived, verified, and removed (with their own receipt) at the start of each rule |
-| **Free-space pre-flight** | Before each job, estimate required space (per `ExpectedCompressionPercent` + buffer) and skip gracefully if it won't fit. Jobs run smallest-first so each completion can free space for the next |
-| **Smallest-first ordering** | On a tight disk, completing small jobs first frees source space; once one job doesn't fit, no larger one will, so the rest are skipped with exit code 2 |
-| **Resource throttling** | Best-effort lower priority + CPU affinity so the tool doesn't starve the host; failure is logged and ignored |
-| **Exit codes 0/1/2** | The external scheduler reads only the exit code, so errors are logged (never re-thrown) and the global finally exits deterministically |
-| **Async logger** | Prevents log I/O from blocking the main archival loop |
-| **JSON receipts** | Provides an audit trail with file paths, archive paths, and original UTC write times |
-| **InvariantCulture** | Ensures consistent date/number formatting across different machine locales |
-| **PowerShell 4 compatibility** | Targets Windows PowerShell 4; avoids PS5-only syntax such as `[type]::new()` |
+Errors are isolated at three nested scopes to prevent a single failure from crashing the entire process:
+
+```
+[Global Scope]
+   │
+   ├── [Rule Scope] (For each rule)
+   │      │
+   │      └── [Job Scope] (For each job inside a rule)
+```
+
+| Scope | Failure Impact | Recovery Action |
+|---|---|---|
+| **Job Scope** | Skips the current job. Larger jobs in the same rule are also skipped if caused by a space limit. | Deletes a fresh partial archive if created; leaves the temp directory intact. |
+| **Rule Scope** | Skips the current rule and proceeds to the next rule in the configuration list. | Cleans up rule-specific state. |
+| **Global Scope** | Summarizes errors and warnings and completes execution. | Flushes the queue, stops the background runspace, and writes the summary log. |
+
+### Exit Code Mapping
+
+The scheduler inspects the exit code to determine job health. The global `finally` block maps the run's logged metrics to the exit code:
+
+*   **Exit Code `0` (Clean)**: Completed with no errors and no warnings.
+*   **Exit Code `1` (Warnings)**: Script completed, but one or more warnings were logged (e.g., resource throttling failed, locked files fallback, or no files found under a non-mandatory rule).
+*   **Exit Code `2` (Errors)**: Critical failure occurred (e.g., config parsing failure, 7-zip missing, disk space exhaustion, or a mandatory rule had no files matching its pattern).
 
 ---
 
-## 9. File Layout
+## 9. Asynchronous Logger Architecture
 
+Disk writes to log files are offloaded to a background thread to maximize execution speed:
+
+```mermaid
+flowchart TD
+    main["main.ps1 (Main Thread)"] -->|Enqueue string| queue["ConcurrentQueue[string]"]
+    subgraph runspace["Background Runspace Consumer Loop"]
+        loop["While StopEvent not set"] --> dequeue["Try Dequeue message"]
+        dequeue -->|Success| write["Add-Content (UTF-8) to log_*.log"]
+        dequeue -->|Empty| sleep["Wait (100ms)"]
+        write --> loop
+        sleep --> loop
+    end
+    shutdown["Stop-LogProcessor (Set StopEvent)"] --> flush["Flush remaining queue items"]
+    flush --> dispose["Dispose Runspace & PowerShell"]
 ```
-shiny-pancake/
-├── main.ps1                          # Entry point, orchestrator
-├── configurations/
-│   └── directories_list.json         # Archiving rules config
-├── modules/
-│   ├── logger/
-│   │   └── logger.psm1               # Async producer-consumer logger
-│   └── fileimport/
-│       └── fileimport.psm1           # JSON file reader
-├── bin/
-│   └── 7zip/
-│       └── 7za.exe                   # 7-Zip portable executable
-├── logs/                             # Auto-created
-│   └── log_YYYY-MM-DD.log            # Execution log
-├── receipt/                          # Auto-created
-│   └── YYYY-MM-DD/
-│       └── <JobName>_<unix_ts>.json  # Per-job receipts
-└── docs/
-    └── design/
-        ├── ARCHITECTURE.md           # This document
-        └── FLOWCHARTS.md             # Companion Mermaid flowcharts
-```
+
+*   **Producer-Consumer Pattern**: Main orchestrator calls `Add-LogMessage`, which increments counts (`WarnCount`/`ErrorCount`) and enqueues a formatted log string.
+*   **Thread Safety**: Handled by .NET's thread-safe `ConcurrentQueue`.
+*   **Flush Guarantee**: When `Stop-LogProcessor` is called, it signals the thread to stop and performs a final dequeue loop to write any remaining logs before disposing resources.
+
+This architectural description covers all components, math formulas, and design criteria of the archiving script.
