@@ -4,6 +4,7 @@
 # agents
 .agents/
 .claude/
+CLAUDE.md
 
 # Script output
 logs/
