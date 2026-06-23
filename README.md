@@ -5,7 +5,7 @@ PowerShell script for log rotation and archiving. Reads rules from a JSON config
 ## Requirements
 
 - Windows PowerShell 4+
-- 7-Zip portable executable at `bin\7zip\7za.exe`
+- 7-Zip standalone executable at `bin\7zip\x64\7za.exe`
 
 ## Usage
 
